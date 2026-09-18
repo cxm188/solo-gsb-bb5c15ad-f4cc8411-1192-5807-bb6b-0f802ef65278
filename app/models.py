@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from functools import lru_cache
 
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MAX_TRANSACTIONS_PER_SIDE = 12
+
+
+@lru_cache(maxsize=256)
+def get_timezone(name: str) -> ZoneInfo:
+    """Return a (cached) IANA time zone.
+
+    ``ZoneInfo`` instances are immutable and the library docs recommend
+    caching them; the cache also lets request models share one instance.
+    """
+    return ZoneInfo(name)
 
 
 class TransactionIn(BaseModel):
@@ -92,3 +104,49 @@ class ReconcileResponse(BaseModel):
     total_amount: int  # sum of absolute reconciled amounts across groups
     unmatched_left_ids: list[str]
     unmatched_right_ids: list[str]
+
+
+class UnmatchedSummaryRequest(ReconcileRequest):
+    """A reconcile batch plus the IANA time zone used to bucket unmatched flows.
+
+    ``timezone`` must be an IANA time-zone name (e.g. ``Asia/Shanghai`` or
+    ``America/New_York``); unknown names are rejected with 422.
+    """
+
+    timezone: StrictStr = Field(
+        min_length=1,
+        max_length=64,
+        description="IANA time zone used to attribute unmatched flows to local dates.",
+    )
+
+    @field_validator("timezone")
+    @classmethod
+    def timezone_must_be_iana(cls, v: str) -> str:
+        try:
+            get_timezone(v)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("timezone must be a valid IANA time zone name") from None
+        return v
+
+
+class SignBucket(BaseModel):
+    """Count and absolute amount of unmatched flows of one sign."""
+
+    count: int
+    amount: int  # sum of absolute amounts (cents)
+
+
+class DaySummary(BaseModel):
+    """Unmatched flows attributed to one local date."""
+
+    date: date
+    positive: SignBucket
+    negative: SignBucket
+
+
+class UnmatchedSummaryResponse(BaseModel):
+    timezone: str
+    days: list[DaySummary]  # ascending local date
+    total: SignBucket  # all unmatched flows, both signs
+    positive: SignBucket
+    negative: SignBucket

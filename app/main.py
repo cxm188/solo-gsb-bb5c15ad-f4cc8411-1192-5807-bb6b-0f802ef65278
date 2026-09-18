@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from datetime import date, timezone as dt_timezone
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
@@ -11,7 +12,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response
 
 from .idempotency import FingerprintConflict, canonical_fingerprint, store
-from .models import GroupOut, ReconcileRequest, ReconcileResponse
+from .models import (
+    DaySummary,
+    GroupOut,
+    ReconcileRequest,
+    ReconcileResponse,
+    SignBucket,
+    UnmatchedSummaryRequest,
+    UnmatchedSummaryResponse,
+    get_timezone,
+)
 from .solver import (
     ExcludedPair,
     ExcludedPairError,
@@ -169,3 +179,70 @@ def reconcile(
         raise HTTPException(status_code=409, detail=str(exc))
 
     return _stored_response(result.body, result.replayed)
+
+
+def build_unmatched_summary(payload: UnmatchedSummaryRequest) -> UnmatchedSummaryResponse:
+    """Run the same solve/validation as ``/reconcile`` and bucket the
+    unmatched flows by local date and sign in the requested IANA zone."""
+    result = solve(payload)
+
+    tz = get_timezone(payload.timezone)
+    by_id = {t.id: t for t in payload.left}
+    by_id.update({t.id: t for t in payload.right})
+
+    # date -> [[positive count, positive absolute amount], [negative ...]]
+    buckets: dict[date, list[list[int]]] = {}
+    tot_pos = [0, 0]
+    tot_neg = [0, 0]
+    for unmatched_id in result.unmatched_left_ids + result.unmatched_right_ids:
+        txn = by_id[unmatched_id]
+        dt = txn.time
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=dt_timezone.utc)
+        # astimezone follows the zone's real offset at the instant, so DST
+        # transition days are attributed to the actual local calendar date.
+        local_date = dt.astimezone(tz).date()
+        slot = buckets.setdefault(local_date, [[0, 0], [0, 0]])
+        if txn.amount > 0:
+            slot[0][0] += 1
+            slot[0][1] += abs(txn.amount)
+            tot_pos[0] += 1
+            tot_pos[1] += abs(txn.amount)
+        else:
+            slot[1][0] += 1
+            slot[1][1] += abs(txn.amount)
+            tot_neg[0] += 1
+            tot_neg[1] += abs(txn.amount)
+
+    days = [
+        DaySummary(
+            date=d,
+            positive=SignBucket(count=b[0][0], amount=b[0][1]),
+            negative=SignBucket(count=b[1][0], amount=b[1][1]),
+        )
+        for d, b in sorted(buckets.items())
+    ]
+    positive = SignBucket(count=tot_pos[0], amount=tot_pos[1])
+    negative = SignBucket(count=tot_neg[0], amount=tot_neg[1])
+    return UnmatchedSummaryResponse(
+        timezone=payload.timezone,
+        days=days,
+        total=SignBucket(
+            count=positive.count + negative.count,
+            amount=positive.amount + negative.amount,
+        ),
+        positive=positive,
+        negative=negative,
+    )
+
+
+@app.post(
+    "/reconcile/unmatched-summary",
+    response_model=UnmatchedSummaryResponse,
+    responses={
+        400: {"description": "Duplicate transaction id in the batch."},
+        422: {"description": "Invalid batch, locked groups, excluded pairs or IANA timezone."},
+    },
+)
+def unmatched_summary(payload: UnmatchedSummaryRequest) -> UnmatchedSummaryResponse:
+    return build_unmatched_summary(payload)

@@ -155,6 +155,56 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `total_amount`：各组核销金额绝对值之和（分）；
 - `unmatched_left_ids` / `unmatched_right_ids`：两侧未匹配的 ID（升序）。
 
+### `POST /reconcile/unmatched-summary`
+
+在 `/reconcile` 的同一套求解与校验之上，把求解后**两侧所有未匹配流水**按请求指定的
+IANA 时区归属到本地日，再按“日期 × 正负号”聚合**笔数**与**绝对金额**（分），并给出
+全批次总计。
+
+**请求体**：与 `/reconcile` 完全相同（`left` / `right` / `locked_groups` /
+`excluded_pairs` 均支持，校验规则与错误码一致），额外增加必填字段：
+
+| 字段       | 说明                                                                 |
+| ---------- | -------------------------------------------------------------------- |
+| `timezone` | IANA 时区名（如 `Asia/Shanghai`、`America/New_York`、`UTC`）；非法时区返回 **422**（`loc` 为 `["body", "timezone"]`），固定偏移量（如 `+08:00`）、非 IANA 缩写（如 `CST`）均会被拒绝 |
+
+未匹配流水的时刻先按 `/reconcile` 的规则归一化为 UTC（无时区按 UTC），再用
+`astimezone` 转换到请求时区取本地日期——因此**跨夏令时日期按真实本地日期归属**
+（例如纽约 2026-11-01 回退当天，04:30Z 对应本地 00:30 EDT、06:30Z 对应本地
+01:30 EST，两笔都计入本地日 `2026-11-01`）。
+
+**响应示例**
+
+```json
+{
+  "timezone": "America/New_York",
+  "days": [
+    {
+      "date": "2026-09-17",
+      "positive": { "count": 1, "amount": 70 },
+      "negative": { "count": 0, "amount": 0 }
+    },
+    {
+      "date": "2026-11-01",
+      "positive": { "count": 0, "amount": 0 },
+      "negative": { "count": 1, "amount": 50 }
+    }
+  ],
+  "total": { "count": 2, "amount": 120 },
+  "positive": { "count": 1, "amount": 70 },
+  "negative": { "count": 1, "amount": 50 }
+}
+```
+
+- `days`：有未匹配流水的本地日（升序），每天给出正/负两个桶，桶内 `count` 为笔数、
+  `amount` 为该桶金额绝对值之和（分），没有对应符号时为 `{ "count": 0, "amount": 0 }`；
+- `total`：全批次（两侧合并、跨全部日期、正负合并）未匹配笔数与绝对金额总计；
+- `positive` / `negative`：全批次按符号的小计。
+
+该接口复用 `/reconcile` 的全部求解与校验：重复批次 ID 返回 **400**，非法
+`locked_groups` / `excluded_pairs` 返回与 `/reconcile` 相同下标的 **422**。
+本接口不参与 `Idempotency-Key` 幂等逻辑。
+
 ### 幂等重放（`Idempotency-Key` 请求头，可选）
 
 `POST /reconcile` 支持通过 `Idempotency-Key` 请求头实现幂等重放：
@@ -216,7 +266,7 @@ pytest
 
 ```
 app/
-  main.py         # FastAPI 入口与 /reconcile 端点
+  main.py         # FastAPI 入口与 /reconcile、/reconcile/unmatched-summary 端点
   models.py       # 请求/响应模型与校验
   solver.py       # 候选生成 + 最优互斥集求解
   idempotency.py  # Idempotency-Key 指纹与 SQLite 持久化
