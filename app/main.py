@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response
 
 from .idempotency import FingerprintConflict, canonical_fingerprint, store
-from .models import GroupOut, ReconcileRequest, ReconcileResponse
+from .models import (
+    DaySummary,
+    GroupOut,
+    ReconcileRequest,
+    ReconcileResponse,
+    SignBreakdown,
+    UnmatchedSummaryRequest,
+    UnmatchedSummaryResponse,
+)
 from .solver import (
     ExcludedPair,
     ExcludedPairError,
@@ -169,3 +179,38 @@ def reconcile(
         raise HTTPException(status_code=409, detail=str(exc))
 
     return _stored_response(result.body, result.replayed)
+
+
+@app.post("/reconcile/unmatched-summary", response_model=UnmatchedSummaryResponse)
+def unmatched_summary(payload: UnmatchedSummaryRequest) -> UnmatchedSummaryResponse:
+    """Aggregate unmatched flows by local day and amount sign.
+
+    Runs the exact same validation and reconciliation as ``POST /reconcile``
+    (same 400/422 behaviour), then attributes every unmatched transaction to
+    its local calendar day in the requested IANA timezone -- DST transitions
+    included -- and aggregates count and absolute amount per sign, plus
+    whole-batch totals.
+    """
+    result = solve(payload)
+    tz = ZoneInfo(payload.timezone)
+    by_id = {t.id: t for t in payload.left + payload.right}
+
+    per_day: dict[date, SignBreakdown] = {}
+    total = SignBreakdown()
+    for tid in result.unmatched_left_ids + result.unmatched_right_ids:
+        txn = by_id[tid]
+        day = datetime.fromtimestamp(txn.epoch_seconds(), tz=tz).date()
+        bucket = per_day.setdefault(day, SignBreakdown())
+        for acc in (bucket, total):
+            sign = acc.positive if txn.amount > 0 else acc.negative
+            sign.count += 1
+            sign.amount += abs(txn.amount)
+
+    return UnmatchedSummaryResponse(
+        timezone=payload.timezone,
+        days=[
+            DaySummary(date=day, positive=b.positive, negative=b.negative)
+            for day, b in sorted(per_day.items())
+        ],
+        total=total,
+    )

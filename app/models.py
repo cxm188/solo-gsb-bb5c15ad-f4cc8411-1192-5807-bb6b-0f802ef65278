@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 
@@ -92,3 +93,49 @@ class ReconcileResponse(BaseModel):
     total_amount: int  # sum of absolute reconciled amounts across groups
     unmatched_left_ids: list[str]
     unmatched_right_ids: list[str]
+
+
+class UnmatchedSummaryRequest(ReconcileRequest):
+    """Reconcile batch plus the IANA timezone used to localise unmatched flows.
+
+    The batch fields and their validation are identical to
+    ``ReconcileRequest``; ``timezone`` must be a valid IANA key such as
+    ``"Asia/Shanghai"`` — anything else is rejected with 422.
+    """
+
+    timezone: StrictStr = Field(min_length=1, max_length=64)
+
+    @field_validator("timezone")
+    @classmethod
+    def timezone_must_be_iana_key(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown IANA timezone: {v!r}") from exc
+        return v
+
+
+class SignSummary(BaseModel):
+    """Count and absolute amount (cents) of unmatched flows of one sign."""
+
+    count: int = 0
+    amount: int = 0  # sum of absolute amounts in cents
+
+
+class SignBreakdown(BaseModel):
+    """Unmatched flows split by amount sign."""
+
+    positive: SignSummary = Field(default_factory=SignSummary)
+    negative: SignSummary = Field(default_factory=SignSummary)
+
+
+class DaySummary(SignBreakdown):
+    """Unmatched flows attributed to one local calendar day (YYYY-MM-DD)."""
+
+    date: date
+
+
+class UnmatchedSummaryResponse(BaseModel):
+    timezone: str  # validated IANA key the local dates were computed with
+    days: list[DaySummary]  # ascending by local date; only days with unmatched flows
+    total: SignBreakdown  # whole-batch totals across all days

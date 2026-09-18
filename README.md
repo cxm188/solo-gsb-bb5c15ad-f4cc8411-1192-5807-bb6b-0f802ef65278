@@ -185,6 +185,52 @@ curl -X POST http://localhost:8000/reconcile \
 环境变量配置），**容器重启后仍可重放**。本地直接运行时默认写入工作目录下的
 `idempotency.db`。
 
+### `POST /reconcile/unmatched-summary`
+
+按指定时区汇总未匹配流水。请求体在 `POST /reconcile` 全部字段（`left` / `right` /
+`locked_groups` / `excluded_pairs`，校验规则与求解结果完全一致）之上，额外要求一个
+`timezone` 字段：
+
+```json
+{
+  "left":  [{ "id": "L1", "time": "2026-09-17T16:00:00Z", "amount": 100 }],
+  "right": [],
+  "timezone": "Asia/Shanghai"
+}
+```
+
+- `timezone` 必须是合法的 IANA 时区名（如 `UTC`、`Asia/Shanghai`、`America/New_York`）；
+  非法取值返回 **422**，错误 `loc` 为 `["body", "timezone"]`。
+- 服务端先按 `POST /reconcile` 相同的逻辑完成校验与求解（重复 ID 返回 **400**，
+  `locked_groups` / `excluded_pairs` 校验失败返回 **422**），再把两侧**未匹配**流水
+  （已匹配的流水不计入）的时间戳转换到请求时区，按**真实本地日期**归属——跨夏令时
+  切换的日期按当时实际偏移计算。
+- 该接口不参与 `Idempotency-Key` 幂等重放。
+
+**响应示例**
+
+```json
+{
+  "timezone": "Asia/Shanghai",
+  "days": [
+    {
+      "date": "2026-09-18",
+      "positive": { "count": 2, "amount": 300 },
+      "negative": { "count": 1, "amount": 50 }
+    }
+  ],
+  "total": {
+    "positive": { "count": 2, "amount": 300 },
+    "negative": { "count": 1, "amount": 50 }
+  }
+}
+```
+
+- `days`：有未匹配流水的本地日期（`YYYY-MM-DD`，升序），每日按正负号分别给出
+  `count`（笔数）与 `amount`（绝对金额之和，分）；
+- `total`：全批次跨日期的正负号总计；
+- 没有未匹配流水时 `days` 为空数组，`total` 各项为 0。
+
 ## 算法
 
 1. 枚举全部合法候选组（每侧 ≤12 笔，候选上限约 7000 个）；
@@ -216,7 +262,7 @@ pytest
 
 ```
 app/
-  main.py         # FastAPI 入口与 /reconcile 端点
+  main.py         # FastAPI 入口与 /reconcile、/reconcile/unmatched-summary 端点
   models.py       # 请求/响应模型与校验
   solver.py       # 候选生成 + 最优互斥集求解
   idempotency.py  # Idempotency-Key 指纹与 SQLite 持久化
